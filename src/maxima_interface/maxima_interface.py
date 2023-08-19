@@ -16,6 +16,7 @@ import time
 from typing import List, Optional
 from enum import Enum
 
+import json
 
 class MaximaNotInstalled(Exception):
     def __str__(self):
@@ -70,7 +71,10 @@ class MaximaInterface:
         self.maxima_thread = None
 
         self.maxima_pid = -1
+        
+        # first command to maxima is to turn off pretty printing
         self.maxima_setup_command = "display2d:false$"
+        #self.maxima_setup_command = "display2d:false;"
 
         # check if maxima is installedc$a
         if not self.__is_maxima_installed():
@@ -86,6 +90,11 @@ class MaximaInterface:
         while self.maxima_server_state != MaximaServerState.WAITING_FOR_COMMAND:
             time.sleep(0.01)
 
+        #command_string = self.maxima_setup_command
+        #self.__debug_message(f'sending command to server: "{command_string}"')
+        #os.write(self.command_pipe_write, command_string.encode())
+        self.raw_command(self.maxima_setup_command)
+        
         self.__debug_message("initialized.")
 
     def __debug_message(self, message: str) -> None:
@@ -119,10 +128,10 @@ class MaximaInterface:
         # state variable to indicate that a result has been received
         # this to not overwrite the maxima's result as maxima sends the result
         # and the prompt at different times
-        got_result = False
+        #got_result = False
+        command, command_sent = None, False
+        response_arr = []  # cumulative array of responses
 
-        # first command to maxima is to turn off pretty printing
-        command = self.maxima_setup_command
         # open socket server
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             # wait for incoming connection from maxima
@@ -137,14 +146,14 @@ class MaximaInterface:
                         break
 
                     # send command to maxima
-                    if command is not None:
+                    if command is not None and not command_sent:
                         self.__debug_message(
                             f'server: sending command to maxima: "{command}"'
                         )
                         conn.sendall(command.encode())
-                        command = None
+                        command_sent = True  # Send once
 
-                    # waiting for maximas response
+                    # waiting for maxima's response
                     self.maxima_server_state = MaximaServerState.WAITING_FOR_MAXIMA
                     self.__debug_message(f"server: state={self.maxima_server_state}")
 
@@ -152,35 +161,37 @@ class MaximaInterface:
                     response = conn.recv(1024).decode()
                     if not response:
                         break
-                    response = response.split("\n")
-
-                    # interpret maxima's response
                     self.__debug_message(f'server: received "{response}"')
-                    if not got_result:
-                        result = self.__format_maxima_result(response)
-                        self.__debug_message(f'server: maxima result "{result}"')
-                    if result is not None:
-                        got_result = True
-                        self.__debug_message(f"server: got_result={got_result}")
+                    response = response.split("\n")
+                    response_arr.extend(response)
 
                     # check if maxima is ready to accept new commands
                     got_input_prompt = self.__check_if_input_prompt(response)
                     self.__debug_message(f"server: got_input_prompt={got_input_prompt}")
-
+                    
                     if got_input_prompt:
                         self.maxima_server_state = MaximaServerState.WAITING_FOR_COMMAND
                         self.__debug_message(
                             f"server: state={self.maxima_server_state}"
                         )
+                        
+                        # Split reponse_arr into output and other[] lines
+                        result, other = self.__format_maxima_result(response_arr)
+                        self.__debug_message(f'server: maxima result "{result}"')
+                        self.__debug_message(f'server: maxima other  "{other}"')
+                        response_arr=[] # Reset response queue
 
                         # return result after the server is in correct state to accept a new command
-                        if result is not None:
-                            self.__debug_message(f'server: returning result "{result}"')
-                            os.write(self.result_pipe_write, result.encode())
-                            got_result = False
-
+                        if command_sent:  # Only send back if we got a command...
+                            self.__debug_message(f'server: returning result,other for {command}')
+                            resp={'out':result, 'err':other}
+                            os.write(self.result_pipe_write, json.dumps(resp).encode())
+                        else:
+                            self.__debug_message(f'server: discard non-command output')
+                            pass
+                            
                         # server waits for new command
-                        command = os.read(self.command_pipe_read, 1024).decode()
+                        command, command_sent = os.read(self.command_pipe_read, 1024).decode(), False
                         self.__debug_message(f'server: received command: "{command}"')
 
     def __check_if_input_prompt(self, response: List[str]) -> bool:
@@ -198,7 +209,7 @@ class MaximaInterface:
                 return True
         return False
 
-    def __format_maxima_result(self, response: List[str]) -> Optional[str]:
+    def __format_maxima_result(self, response: List[str]) -> (str, List[str]):
         """
         checks if the maxima response contains a result line (%o[0-9]+)
         and if that is the case the result is formatted otherwise None is returned
@@ -208,8 +219,10 @@ class MaximaInterface:
 
         Returns:
             Optional[str]: formatted result or None
+            Optional[List]str]]: lines other than the result or None
+            
         """
-        maxima_result = None
+        result, other = '', []
 
         for l in response:
             line = l.strip()
@@ -218,8 +231,15 @@ class MaximaInterface:
             if str.startswith(line, "(%o"):
                 # format result by removing prompt and white space
                 end_of_prefix = line.find(")")
-                maxima_result = line[end_of_prefix + 2 :].strip()
-            return maxima_result
+                result = line[end_of_prefix + 2 :].strip()
+            elif str.startswith(line, "(%i"):  # Discard any input lines
+              pass
+            elif len(line)==0:  # Discard blank lines
+              pass
+            else:
+              other.append(l)
+              
+        return result, other
 
     def __start_maxima(self) -> None:
         """starts maxima client process in a thread"""
@@ -228,12 +248,13 @@ class MaximaInterface:
 
     def __connect_maxima_to_server(self) -> None:
         """starts maxima and connects it to socket server"""
-        maxima_command = f"maxima -s {self.port}"
+        maxima_command = f"maxima --server={self.port}"
+        #maxima_command = f'maxima -r ":lisp (setup-client {self.port})"'
         process = subprocess.Popen(
             maxima_command,
             shell=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            #stderr=subprocess.STDOUT,
             preexec_fn=os.setsid,
         )
 
@@ -242,7 +263,7 @@ class MaximaInterface:
         stdout_iterator = iter(process.stdout.readline, b"")
 
         for line in stdout_iterator:
-            self.__debug_message(f"maxima: {line.decode()}")
+            self.__debug_message(f"maxima stdout_iterator : {line.decode()}")
 
     def __kill_subprocess(self, pid: int) -> None:
         """
@@ -288,13 +309,36 @@ class MaximaInterface:
         Returns:
             str: maxima result
         """
+        out, err = self.command_outerr(command_string)
+        return out
+
+    def command_outerr(self, command_string: str) -> (str, Optional[List[str]]):
+        """
+        sends a command as a string to maxima
+
+        Args:
+            command_string (str): string containing the command
+
+        Raises:
+            MaximaServerNotAcceptingCommandException: raised when server is not accepting commands
+
+        Returns:
+            str: maxima result
+        """
         # check if maxima server is waiting for a command
         if self.maxima_server_state != MaximaServerState.WAITING_FOR_COMMAND:
             self.__debug_message("server is not accepting commands.")
             raise MaximaServerNotAcceptingCommandException()
 
-        else:
-            # send command to maxima server
-            self.__debug_message(f'sending command to server: "{command_string}"')
-            os.write(self.command_pipe_write, command_string.encode())
-            return os.read(self.result_pipe_read, 1024).decode()
+        # send command to maxima server
+        self.__debug_message(f'sending command to server: "{command_string}"')
+        os.write(self.command_pipe_write, command_string.encode())
+        
+        self.__debug_message(f'reading back result from server...')
+        json_resp = os.read(self.result_pipe_read, 1024).decode()
+        self.__debug_message(f"server sent back json : {json_resp}")
+        resp = json.loads(json_resp)
+        
+        err=resp.get('err', [])
+        if len(err)==0: err=None  # This is so we can use 'if err is None' later
+        return resp.get('out', ''), err
