@@ -20,17 +20,17 @@ import json
 
 class MaximaNotInstalled(Exception):
     def __str__(self):
-        return "'maxima' command cound not be found on this system."
+        return "'maxima' itself cound not be found on this system."
 
 
 class MaximaServerNotAcceptingCommandException(Exception):
     def __str__(self):
-        return "maxima server does not accept a command, it is waiting for a response from maxima."
+        return "maxima server refused the command, it is waiting for a response from maxima."
 
 
 class NoMaximaPrompt(Exception):
     def __str__(self):
-        return "maxima does not accept a command."
+        return "maxima not ready to accept a command."
 
 
 class MaximaServerState(Enum):
@@ -58,6 +58,7 @@ class MaximaInterface:
 
         self.port = port
         self.host = "127.0.0.1"
+        self.timeout = 5 # timeout for maxima recv() operations (in seconds)
 
         self.command_pipe_read = None
         self.command_pipe_write = None
@@ -71,9 +72,13 @@ class MaximaInterface:
         self.maxima_thread = None
 
         self.maxima_pid = -1
+
+        self.MAXIMA_TIMEOUT='__TIMEOUT__'
+
         
         # first command to maxima is to turn off pretty printing
         self.maxima_setup_command = "display2d:false$"
+        #self.maxima_setup_command = "display1d:false$display2d:false$"
         #self.maxima_setup_command = "display2d:false;"
 
         # check if maxima is installedc$a
@@ -138,6 +143,7 @@ class MaximaInterface:
             s.bind((self.host, self.port))
             s.listen()
             conn, addr = s.accept()
+            conn.settimeout(self.timeout)  # timeout for subsequent recv() operations
             with conn:
                 while True:
                     # check if command is intended for server of for maxima
@@ -158,16 +164,23 @@ class MaximaInterface:
                     self.__debug_message(f"server: state={self.maxima_server_state}")
 
                     # a response is composed out of several lines
-                    response = conn.recv(1024).decode()
-                    if not response:
-                        break
-                    self.__debug_message(f'server: received "{response}"')
-                    response = response.split("\n")
-                    response_arr.extend(response)
+                    try:
+                        response_raw = conn.recv(1024)
+                        response = response_raw.decode()
+                        if not response:
+                            break
+                        self.__debug_message(f'server: received "{response_raw}"')
+                        response = response.split("\n")
+                        response_arr.extend(response)
 
-                    # check if maxima is ready to accept new commands
-                    got_input_prompt = self.__check_if_input_prompt(response)
-                    self.__debug_message(f"server: got_input_prompt={got_input_prompt}")
+                        # check if maxima is ready to accept new commands
+                        got_input_prompt = self.__check_if_input_prompt(response)
+                        self.__debug_message(f"server: got_input_prompt={got_input_prompt}")
+
+                    except socket.timeout as err:  # Treat timeouts separately
+                        self.__debug_message(f"timeout : after {self.timeout} seconds : {err}")  
+                        got_input_prompt=True  # Assume the timeout was due to an error message
+                        response_arr.append(self.MAXIMA_TIMEOUT)
                     
                     if got_input_prompt:
                         self.maxima_server_state = MaximaServerState.WAITING_FOR_COMMAND
@@ -181,7 +194,8 @@ class MaximaInterface:
                         self.__debug_message(f'server: maxima other  "{other}"')
                         response_arr=[] # Reset response queue
 
-                        # return result after the server is in correct state to accept a new command
+                        # return result to python side after 
+                        #   the server is in correct state to accept a new command
                         if command_sent:  # Only send back if we got a command...
                             self.__debug_message(f'server: returning result,other for {command}')
                             resp={'out':result, 'err':other}
@@ -190,7 +204,7 @@ class MaximaInterface:
                             self.__debug_message(f'server: discard non-command output')
                             pass
                             
-                        # server waits for new command
+                        # server waits for new command from python side
                         command, command_sent = os.read(self.command_pipe_read, 1024).decode(), False
                         self.__debug_message(f'server: received command: "{command}"')
 
@@ -260,9 +274,7 @@ class MaximaInterface:
 
         self.maxima_pid = process.pid
 
-        stdout_iterator = iter(process.stdout.readline, b"")
-
-        for line in stdout_iterator:
+        for line in iter(process.stdout.readline, b""):
             self.__debug_message(f"maxima stdout_iterator : {line.decode()}")
 
     def __kill_subprocess(self, pid: int) -> None:
@@ -278,6 +290,12 @@ class MaximaInterface:
 
         process.kill()
 
+    #def kill_maxima_subprocess(self):
+    #    self.__kill_subprocess(self.maxima_pid)
+    #    self.maxima_thread.join()
+    #def start_maxima_subprocess(self):
+    #    self.__start_maxima()
+    
     def close(self) -> None:
         """kills maxima client process, closes socket server, and closes named pipes for commands and results"""
         # send SIGTERM to maxima sub process
@@ -335,7 +353,7 @@ class MaximaInterface:
         os.write(self.command_pipe_write, command_string.encode())
         
         self.__debug_message(f'reading back result from server...')
-        json_resp = os.read(self.result_pipe_read, 1024).decode()
+        json_resp = os.read(self.result_pipe_read, 4096).decode()
         self.__debug_message(f"server sent back json : {json_resp}")
         resp = json.loads(json_resp)
         
